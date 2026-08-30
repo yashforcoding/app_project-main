@@ -79,6 +79,36 @@ function normalizeTransaction(row: Record<string, unknown>): Transaction {
   };
 }
 
+type Contact = { id: string; name: string; mobileNumber: string | null };
+
+function normalizeContact(row: Record<string, unknown>): Contact {
+  return {
+    id: String(row.id),
+    name: String(row.name ?? ""),
+    mobileNumber: typeof row.mobile_number === "string" ? row.mobile_number : null,
+  };
+}
+
+/** Case-insensitive exact-name lookup. Returns null if this recipient has never been paid before. */
+async function findContact(name: string): Promise<Contact | null> {
+  const rows = await supabase(
+    `contacts?name=ilike.${encodeURIComponent(name)}&select=id,name,mobile_number&limit=1`,
+  );
+  const row = (rows as Record<string, unknown>[])[0];
+  return row ? normalizeContact(row) : null;
+}
+
+async function createContact(name: string, mobileNumber: string): Promise<Contact> {
+  const created = await supabase("contacts", {
+    method: "POST",
+    headers: { Prefer: "return=representation" },
+    body: JSON.stringify({ name, mobile_number: mobileNumber }),
+  });
+  return normalizeContact((created as Record<string, unknown>[])[0]);
+}
+
+const MOBILE_PATTERN = /^\d{10}$/;
+
 async function getDashboard() {
   const wallets = await supabase("wallets?select=balance,currency&limit=1");
   const rows = await supabase(
@@ -334,6 +364,23 @@ router.post("/finance/command", async (req: Request, res) => {
     if (!amount || amount <= 0) throw new Error("I could not find a valid amount to send");
     if (!recipient) throw new Error("Who would you like to send this to?");
 
+    // First payment to this name? Create their contact record (with a mobile number) before
+    // ever asking for a PIN, so every future payment to them is linked to real transaction history.
+    const contact = await findContact(recipient);
+    if (!contact) {
+      const message = await translateText(
+        `${recipient} is a new recipient. Please add their mobile number to continue.`,
+        lang,
+      );
+      res.json({
+        intent: parsed.intent,
+        requiresContactInfo: true,
+        pendingPayment: { amount, recipient },
+        message,
+      });
+      return;
+    }
+
     // Validate funds up front so the user isn't asked for a PIN on a request that can't succeed anyway.
     const wallet = await getWalletRow();
     const currentBalance = Number(wallet.balance ?? 0);
@@ -401,10 +448,17 @@ router.post("/finance/confirm-payment", async (req: Request, res) => {
       );
     }
 
+    const contact = await findContact(recipient);
     const created = await supabase("transactions", {
       method: "POST",
       headers: { Prefer: "return=representation" },
-      body: JSON.stringify({ amount, direction: "out", title: `Sent to ${recipient}`, recipient }),
+      body: JSON.stringify({
+        amount,
+        direction: "out",
+        title: `Sent to ${recipient}`,
+        recipient,
+        contact_id: contact?.id ?? null,
+      }),
     });
     const transaction = normalizeTransaction((created as Record<string, unknown>[])[0] ?? {});
 
@@ -425,6 +479,50 @@ router.post("/finance/confirm-payment", async (req: Request, res) => {
   } catch (error) {
     const fallback = error instanceof Error ? error.message : "Unable to complete payment";
     res.status(502).json({ message: await translateText(fallback, lang) });
+  }
+});
+
+router.post("/finance/contacts", async (req: Request, res) => {
+  const name = typeof req.body?.name === "string" ? req.body.name.trim() : "";
+  const mobileNumber = typeof req.body?.mobileNumber === "string" ? req.body.mobileNumber.trim() : "";
+  const lang = normalizeLang(req.body?.lang);
+  if (!name) {
+    res.status(400).json({ message: await translateText("A recipient name is required", lang) });
+    return;
+  }
+  if (!MOBILE_PATTERN.test(mobileNumber)) {
+    res.status(400).json({ message: await translateText("Enter a valid 10-digit mobile number", lang) });
+    return;
+  }
+  try {
+    // Idempotent: if this name already exists (e.g. a retried request), just return it.
+    const existing = await findContact(name);
+    const contact = existing ?? (await createContact(name, mobileNumber));
+    res.json({ contact });
+  } catch (error) {
+    const fallback = error instanceof Error ? error.message : "Unable to save contact";
+    res.status(502).json({ message: await translateText(fallback, lang) });
+  }
+});
+
+router.get("/finance/contacts", async (_req, res) => {
+  try {
+    const rows = await supabase("contacts?select=id,name,mobile_number,created_at&order=name.asc");
+    res.json({ contacts: (rows as Record<string, unknown>[]).map(normalizeContact) });
+  } catch (error) {
+    res.status(502).json({ message: error instanceof Error ? error.message : "Unable to load contacts" });
+  }
+});
+
+router.get("/finance/contacts/:id/transactions", async (req, res) => {
+  const id = req.params.id;
+  try {
+    const rows = await supabase(
+      `transactions?contact_id=eq.${encodeURIComponent(id)}&select=*&order=created_at.desc`,
+    );
+    res.json({ transactions: (rows as Record<string, unknown>[]).map(normalizeTransaction) });
+  } catch (error) {
+    res.status(502).json({ message: error instanceof Error ? error.message : "Unable to load transaction history" });
   }
 });
 

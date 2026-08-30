@@ -28,7 +28,13 @@
         }
       ],
       "expo-font",
-      "expo-web-browser"
+      "expo-web-browser",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Paisa Voice uses your camera to scan UPI QR codes so you can pay faster."
+        }
+      ]
     ],
     "experiments": {
       "typedRoutes": true,

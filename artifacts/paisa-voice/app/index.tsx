@@ -17,6 +17,8 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as Speech from 'expo-speech';
 import { useColors } from '@/hooks/useColors';
 import PinModal from '@/components/PinModal';
+import NewContactModal from '@/components/NewContactModal';
+import QrScannerModal, { type ParsedUpiQr } from '@/components/QrScannerModal';
 import LanguageModal from '@/components/LanguageModal';
 import ConfirmPaymentDialog from '@/components/ConfirmPaymentDialog';
 import { useLanguage } from '@/context/LanguageContext';
@@ -37,6 +39,7 @@ type CommandResult = {
   balance?: number | null;
   transaction?: Transaction | null;
   requiresPin?: boolean;
+  requiresContactInfo?: boolean;
   pinSet?: boolean;
   pendingPayment?: PendingPayment | null;
   confirmPrompt?: string;
@@ -86,6 +89,11 @@ export default function HomeScreen() {
   const recordingChunksRef = useRef<Blob[]>([]);
 
   const [pendingPayment, setPendingPayment] = useState<PendingPayment | null>(null);
+  const [newContactModalVisible, setNewContactModalVisible] = useState(false);
+  const [qrScannerVisible, setQrScannerVisible] = useState(false);
+  const [newContactLoading, setNewContactLoading] = useState(false);
+  const [newContactError, setNewContactError] = useState('');
+  const lastCommandTextRef = useRef('');
   const [confirmDialogVisible, setConfirmDialogVisible] = useState(false);
   const [confirmPrompt, setConfirmPrompt] = useState('');
   const [pendingPinMode, setPendingPinMode] = useState<'verify' | 'setup'>('verify');
@@ -116,6 +124,13 @@ export default function HomeScreen() {
   // Handles a /finance/command response: if it's a payment, first ask the user to
   // confirm out loud (ConfirmPaymentDialog) before ever showing the PIN modal.
   const handleCommandResult = (data: CommandResult) => {
+    if (data.requiresContactInfo && data.pendingPayment) {
+      setPendingPayment(data.pendingPayment);
+      setNewContactError('');
+      setNewContactModalVisible(true);
+      setMessage('');
+      return;
+    }
     if (data.requiresPin && data.pendingPayment) {
       setPendingPayment(data.pendingPayment);
       setPendingPinMode(data.pinSet ? 'verify' : 'setup');
@@ -189,6 +204,22 @@ export default function HomeScreen() {
     setError(t.paymentCancelled);
   };
 
+  // Shared by submitRequest, transcribeRecording, and the retry that runs right after a new
+  // contact is saved — keeping the fetch + response-handling logic in one place.
+  const runCommand = async (text: string) => {
+    lastCommandTextRef.current = text;
+    const response = await fetch(apiUrl('/finance/command'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, lang }),
+    });
+    const data = (await response.json()) as CommandResult & { message?: string };
+    if (!response.ok) throw new Error(data.message ?? t.commandErrorFallback);
+    handleCommandResult(data);
+    if (!data.requiresPin && !data.requiresContactInfo) await loadDashboard();
+    return data;
+  };
+
   const submitRequest = async () => {
     const text = request.trim();
     if (!text || submitting) return;
@@ -196,20 +227,72 @@ export default function HomeScreen() {
     setMessage('');
     setError('');
     try {
-      const response = await fetch(apiUrl('/finance/command'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, lang }),
-      });
-      const data = (await response.json()) as CommandResult & { message?: string };
-      if (!response.ok) throw new Error(data.message ?? t.commandErrorFallback);
-      handleCommandResult(data);
-      if (!data.requiresPin) await loadDashboard();
+      await runCommand(text);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : t.commandErrorFallback);
     } finally {
       setSubmitting(false);
     }
+  };
+
+  // Saves the mobile number for a brand-new recipient, then resubmits the exact same request —
+  // now that the contact exists, the backend proceeds straight to the PIN step.
+  const handleAddContact = async (mobileNumber: string) => {
+    if (!pendingPayment) return;
+    setNewContactLoading(true);
+    setNewContactError('');
+    try {
+      const response = await fetch(apiUrl('/finance/contacts'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: pendingPayment.recipient, mobileNumber, lang }),
+      });
+      const data = (await response.json()) as { message?: string };
+      if (!response.ok) throw new Error(data.message ?? 'Unable to save contact');
+      setNewContactModalVisible(false);
+      await runCommand(lastCommandTextRef.current);
+    } catch (caught) {
+      setNewContactError(caught instanceof Error ? caught.message : 'Unable to save contact');
+    } finally {
+      setNewContactLoading(false);
+    }
+  };
+
+  const cancelNewContact = () => {
+    setNewContactModalVisible(false);
+    setPendingPayment(null);
+    setNewContactError('');
+    setError(t.paymentCancelled);
+  };
+
+  // A scanned UPI QR code is parsed fully on-device (see QrScannerModal). If it has an amount,
+  // we run it straight through the same command pipeline as a typed/spoken request — so the
+  // existing contact-check and PIN flow apply automatically. If not, we just prefill the amount
+  // field so the user can type one in.
+  const handleQrScanned = async (parsed: ParsedUpiQr) => {
+    setQrScannerVisible(false);
+    if (!parsed.payeeName) {
+      setError('Could not read a recipient from that QR code.');
+      return;
+    }
+    if (parsed.amount && parsed.amount > 0) {
+      const text = `Send ₹${parsed.amount} to ${parsed.payeeName}`;
+      setRequest(text);
+      setSubmitting(true);
+      setMessage('');
+      setError('');
+      try {
+        await runCommand(text);
+      } catch (caught) {
+        setError(caught instanceof Error ? caught.message : t.commandErrorFallback);
+      } finally {
+        setSubmitting(false);
+      }
+      return;
+    }
+    setRequest(`Send ₹ to ${parsed.payeeName}`);
+    setError('');
+    setMessage(`Scanned ${parsed.payeeName} — enter an amount to send.`);
   };
 
   const transcribeRecording = async (audio: Blob): Promise<string> => {
@@ -232,15 +315,7 @@ export default function HomeScreen() {
         throw new Error(transcription.message ?? t.transcriptionErrorFallback);
       }
       setRequest(transcription.text);
-      const commandResponse = await fetch(apiUrl('/finance/command'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: transcription.text, lang }),
-      });
-      const command = (await commandResponse.json()) as CommandResult & { message?: string };
-      if (!commandResponse.ok) throw new Error(command.message ?? t.commandErrorFallback);
-      handleCommandResult(command);
-      if (!command.requiresPin) await loadDashboard();
+      await runCommand(transcription.text);
       return transcription.text;
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : t.recordingErrorFallback);
@@ -382,6 +457,9 @@ export default function HomeScreen() {
                   maxLength={240}
                 />
                 <View style={styles.composerActions}>
+                  <Pressable testID="qr-scan-button" onPress={() => setQrScannerVisible(true)} disabled={submitting} style={({ pressed }) => [styles.iconButton, submitting && styles.disabled, pressed && styles.pressed]}>
+                    <Ionicons name="qr-code-outline" size={19} color={colors.primary} />
+                  </Pressable>
                   <Pressable testID="voice-input-button" onPress={() => void toggleRecording()} disabled={submitting} style={({ pressed }) => [styles.iconButton, recording && styles.recordingButton, submitting && styles.disabled, pressed && styles.pressed]}>
                     <Feather name={recording ? "square" : "mic"} size={19} color={recording ? colors.destructive : colors.primary} />
                   </Pressable>
@@ -419,6 +497,19 @@ export default function HomeScreen() {
         message={confirmPrompt}
         onCancel={handleCancelConfirm}
         onConfirm={handleConfirmPayment}
+      />
+      <QrScannerModal
+        visible={qrScannerVisible}
+        onCancel={() => setQrScannerVisible(false)}
+        onScanned={(parsed) => void handleQrScanned(parsed)}
+      />
+      <NewContactModal
+        visible={newContactModalVisible}
+        recipient={pendingPayment?.recipient ?? ''}
+        loading={newContactLoading}
+        errorText={newContactError}
+        onCancel={cancelNewContact}
+        onSubmit={(mobileNumber) => void handleAddContact(mobileNumber)}
       />
       <PinModal
         visible={pinModalVisible}
