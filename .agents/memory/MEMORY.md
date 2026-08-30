@@ -1,0 +1,1 @@
+- [Supabase connector paths](supabase-connector-paths.md) — verify whether the connected proxy already includes the PostgREST prefix before composing REST URLs.

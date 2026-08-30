@@ -1,0 +1,161 @@
+openapi: 3.1.0
+info:
+  # Do not change the title, if the title changes, the import paths will be broken
+  title: Api
+  version: 0.1.0
+  description: API specification
+servers:
+  - url: /api
+    description: Base API path
+tags:
+  - name: health
+    description: Health operations
+  - name: finance
+    description: Wallet and assistant operations
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: Health check
+      description: Returns server health status
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+  /finance/dashboard:
+    get:
+      operationId: getFinanceDashboard
+      tags: [finance]
+      summary: Get wallet balance and recent transactions
+      responses:
+        "200":
+          description: Finance dashboard
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FinanceDashboard"
+        "502":
+          description: Supabase unavailable
+  /finance/command:
+    post:
+      operationId: submitFinanceCommand
+      tags: [finance]
+      summary: Parse and execute a natural-language finance request
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FinanceCommandRequest"
+      responses:
+        "200":
+          description: Parsed finance command result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FinanceCommandResult"
+        "400":
+          description: Invalid request
+        "502":
+          description: AI or Supabase unavailable
+  /finance/transcribe:
+    post:
+      operationId: transcribeFinanceRequest
+      tags: [finance]
+      summary: Transcribe a recorded finance request
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FinanceTranscriptionRequest"
+      responses:
+        "200":
+          description: Speech transcript
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FinanceTranscriptionResult"
+        "400":
+          description: Invalid audio
+        "502":
+          description: ElevenLabs unavailable
+components:
+  schemas:
+    HealthStatus:
+      type: object
+      properties:
+        status:
+          type: string
+      required:
+        - status
+    FinanceTransaction:
+      type: object
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        amount:
+          type: number
+        direction:
+          type: string
+          enum: [in, out]
+        createdAt:
+          type: string
+      required: [id, title, amount, direction, createdAt]
+    FinanceDashboard:
+      type: object
+      properties:
+        balance:
+          type: number
+        currency:
+          type: string
+        transactions:
+          type: array
+          items:
+            $ref: "#/components/schemas/FinanceTransaction"
+      required: [balance, currency, transactions]
+    FinanceCommandRequest:
+      type: object
+      properties:
+        text:
+          type: string
+      required: [text]
+    FinanceCommandResult:
+      type: object
+      properties:
+        intent:
+          type: string
+          enum: [send_money, check_balance, apply_loan]
+        message:
+          type: string
+        balance:
+          type: number
+          nullable: true
+        transaction:
+          allOf:
+            - $ref: "#/components/schemas/FinanceTransaction"
+          nullable: true
+      required: [intent, message]
+    FinanceTranscriptionRequest:
+      type: object
+      properties:
+        audioBase64:
+          type: string
+          description: Base64-encoded microphone recording
+        mimeType:
+          type: string
+          description: MIME type of the recording
+      required: [audioBase64]
+    FinanceTranscriptionResult:
+      type: object
+      properties:
+        text:
+          type: string
+      required: [text]
+
