@@ -17,6 +17,7 @@ export const DEFAULT_STRINGS = {
   askTitle: 'What would you like to do?',
   askHint: "Ask in your own words. I'll take care of the details.",
   inputPlaceholder: 'Try "send ₹500 to Ramesh"',
+  listeningPlaceholder: 'Listening…',
   recentActivity: 'Recent activity',
   transactionSingular: 'transaction',
   transactionPlural: 'transactions',

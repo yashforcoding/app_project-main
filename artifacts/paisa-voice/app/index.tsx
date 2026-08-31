@@ -23,6 +23,7 @@ import LanguageModal from '@/components/LanguageModal';
 import ConfirmPaymentDialog from '@/components/ConfirmPaymentDialog';
 import { useLanguage } from '@/context/LanguageContext';
 import { DEFAULT_LANGUAGE, getSpeechLocale } from '@/constants/languages';
+import { useNativeVoice } from '@/hooks/useNativeVoice';
 
 type Transaction = {
   id: string;
@@ -220,6 +221,24 @@ export default function HomeScreen() {
     return data;
   };
 
+  // On-device speech recognition (iOS/Android only — see hooks/useNativeVoice.ts).
+  // The phone's own speech recognizer produces the transcript locally, so we skip
+  // /finance/transcribe entirely and send the recognized text straight to runCommand,
+  // exactly as if the user had typed it.
+  const nativeVoice = useNativeVoice({
+    locale: getSpeechLocale(language),
+    onResult: (text) => {
+      setRequest(text);
+      setSubmitting(true);
+      setMessage('');
+      setError('');
+      runCommand(text)
+        .catch((caught) => setError(caught instanceof Error ? caught.message : t.commandErrorFallback))
+        .finally(() => setSubmitting(false));
+    },
+    onError: (errorMessage) => setError(errorMessage),
+  });
+
   const submitRequest = async () => {
     const text = request.trim();
     if (!text || submitting) return;
@@ -327,6 +346,20 @@ export default function HomeScreen() {
 
   const toggleRecording = async () => {
     if (submitting) return;
+
+    // Native (iOS/Android): recognize speech on-device, no audio upload at all.
+    if (Platform.OS !== 'web') {
+      setError('');
+      if (nativeVoice.listening) {
+        await nativeVoice.stop();
+      } else {
+        await nativeVoice.start();
+      }
+      return;
+    }
+
+    // Web: no on-device recognizer available in the browser, so fall back to
+    // recording audio and sending it to /finance/transcribe (ElevenLabs) as before.
     if (recording && recorderRef.current) {
       recorderRef.current.stop();
       return;
@@ -446,22 +479,23 @@ export default function HomeScreen() {
               <View style={styles.composer}>
                 <TextInput
                   testID="finance-request-input"
-                  value={request}
+                  value={nativeVoice.listening && nativeVoice.partialText ? nativeVoice.partialText : request}
                   onChangeText={setRequest}
                   onSubmitEditing={() => void submitRequest()}
-                  placeholder={t.inputPlaceholder}
+                  placeholder={nativeVoice.listening ? t.listeningPlaceholder : t.inputPlaceholder}
                   placeholderTextColor={colors.placeholder}
                   returnKeyType="send"
                   style={styles.input}
                   multiline
                   maxLength={240}
+                  editable={!nativeVoice.listening}
                 />
                 <View style={styles.composerActions}>
                   <Pressable testID="qr-scan-button" onPress={() => setQrScannerVisible(true)} disabled={submitting} style={({ pressed }) => [styles.iconButton, submitting && styles.disabled, pressed && styles.pressed]}>
                     <Ionicons name="qr-code-outline" size={19} color={colors.primary} />
                   </Pressable>
-                  <Pressable testID="voice-input-button" onPress={() => void toggleRecording()} disabled={submitting} style={({ pressed }) => [styles.iconButton, recording && styles.recordingButton, submitting && styles.disabled, pressed && styles.pressed]}>
-                    <Feather name={recording ? "square" : "mic"} size={19} color={recording ? colors.destructive : colors.primary} />
+                  <Pressable testID="voice-input-button" onPress={() => void toggleRecording()} disabled={submitting} style={({ pressed }) => [styles.iconButton, (recording || nativeVoice.listening) && styles.recordingButton, submitting && styles.disabled, pressed && styles.pressed]}>
+                    <Feather name={(recording || nativeVoice.listening) ? "square" : "mic"} size={19} color={(recording || nativeVoice.listening) ? colors.destructive : colors.primary} />
                   </Pressable>
                   <Pressable testID="send-request-button" onPress={() => void submitRequest()} disabled={!request.trim() || submitting} style={({ pressed }) => [styles.sendButton, (!request.trim() || submitting) && styles.disabled, pressed && styles.pressed]}>
                     {submitting ? <ActivityIndicator size="small" color={colors.primaryForeground} /> : <Feather name="arrow-up" size={20} color={colors.primaryForeground} />}

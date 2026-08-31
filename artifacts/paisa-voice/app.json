@@ -14,9 +14,21 @@
       "backgroundColor": "#f7f8f4"
     },
     "ios": {
-      "supportsTablet": false
+      "supportsTablet": false,
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "Paisa Voice uses your microphone to listen for spoken commands like \"send ₹500 to Ramesh\".",
+        "NSSpeechRecognitionUsageDescription": "Paisa Voice converts your spoken commands to text on-device to fill in payments."
+      },
+      "bundleIdentifier": "com.anonymous.paisavoice"
     },
-    "android": {},
+    "android": {
+      "permissions": [
+        "RECORD_AUDIO",
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO"
+      ],
+      "package": "com.anonymous.paisavoice"
+    },
     "web": {
       "favicon": "./assets/images/icon.png"
     },
