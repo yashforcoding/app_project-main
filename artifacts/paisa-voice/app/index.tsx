@@ -16,6 +16,7 @@ import { KeyboardAvoidingView } from 'react-native-keyboard-controller';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as Speech from 'expo-speech';
 import { useColors } from '@/hooks/useColors';
+import { apiUrl } from '@/lib/apiUrl';
 import PinModal from '@/components/PinModal';
 import NewContactModal from '@/components/NewContactModal';
 import QrScannerModal, { type ParsedUpiQr } from '@/components/QrScannerModal';
@@ -47,12 +48,6 @@ type CommandResult = {
 };
 
 const emptyDashboard: Dashboard = { balance: 0, currency: 'INR', transactions: [] };
-
-function apiUrl(path: string) {
-  const domain = process.env.EXPO_PUBLIC_DOMAIN;
-  const base = process.env.EXPO_PUBLIC_API_URL ?? (domain ? `https://${domain}` : '');
-  return `${base}/api${path}`;
-}
 
 function formatMoney(value: number, currency = 'INR') {
   return new Intl.NumberFormat('en-IN', { style: 'currency', currency, maximumFractionDigits: 0 }).format(value);

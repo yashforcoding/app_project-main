@@ -4,6 +4,11 @@ create table if not exists public.wallets (
   currency text not null default 'INR',
   pin_hash text,
   pin_salt text,
+  -- Added for device-to-device offline payments: each installed app instance
+  -- registers itself once (while online) and owns one wallet row from then on.
+  device_id text unique,
+  device_label text,
+  device_public_key text,
   created_at timestamptz not null default now()
 );
 
@@ -13,6 +18,10 @@ create table if not exists public.transactions (
   recipient text,
   amount numeric(12, 2) not null,
   direction text not null check (direction in ('in', 'out')),
+  -- 'online' for normal voice/text commands, 'offline_ble'/'offline_nfc' for
+  -- payments that started as a signed offline intent and settled later.
+  source text not null default 'online',
+  wallet_id bigint references public.wallets (id),
   created_at timestamptz not null default now()
 );
 
@@ -24,9 +33,25 @@ create table if not exists public.loan_applications (
   created_at timestamptz not null default now()
 );
 
--- Safe to re-run: adds the PIN columns even if the table already existed before this change.
+-- Safe to re-run: adds columns even if the tables already existed before this change.
 alter table public.wallets add column if not exists pin_hash text;
 alter table public.wallets add column if not exists pin_salt text;
+alter table public.wallets add column if not exists device_id text unique;
+alter table public.wallets add column if not exists device_label text;
+alter table public.wallets add column if not exists device_public_key text;
+alter table public.transactions add column if not exists source text not null default 'online';
+alter table public.transactions add column if not exists wallet_id bigint references public.wallets (id);
+
+-- Offline payment intents are uniquely identified by their nonce so a retried/duplicated
+-- settlement attempt (e.g. after a flaky reconnect) never double-charges. This table is
+-- the idempotency ledger — POST /finance/offline/settle checks it before touching balances.
+create table if not exists public.offline_settlements (
+  nonce text primary key,
+  from_wallet_id bigint not null references public.wallets (id),
+  to_wallet_id bigint not null references public.wallets (id),
+  amount numeric(12, 2) not null,
+  created_at timestamptz not null default now()
+);
 
 insert into public.wallets (balance, currency)
 select 25000, 'INR'
@@ -35,12 +60,21 @@ where not exists (select 1 from public.wallets);
 alter table public.wallets enable row level security;
 alter table public.transactions enable row level security;
 alter table public.loan_applications enable row level security;
+alter table public.offline_settlements enable row level security;
 
 create policy "Paisa Voice can read wallets"
   on public.wallets for select using (true);
+create policy "Paisa Voice can update wallets"
+  on public.wallets for update using (true);
+create policy "Paisa Voice can insert wallets"
+  on public.wallets for insert with check (true);
 create policy "Paisa Voice can read transactions"
   on public.transactions for select using (true);
 create policy "Paisa Voice can insert transactions"
   on public.transactions for insert with check (true);
 create policy "Paisa Voice can insert loan applications"
   on public.loan_applications for insert with check (true);
+create policy "Paisa Voice can read offline settlements"
+  on public.offline_settlements for select using (true);
+create policy "Paisa Voice can insert offline settlements"
+  on public.offline_settlements for insert with check (true);

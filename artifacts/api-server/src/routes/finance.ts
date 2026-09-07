@@ -1,5 +1,17 @@
 import { Router, type IRouter, type Request } from "express";
 import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
+import nacl from "tweetnacl";
+
+function verifySignature(message: string, signatureB64: string, publicKeyB64: string): boolean {
+  try {
+    const messageBytes = new TextEncoder().encode(message);
+    const signature = Buffer.from(signatureB64, "base64");
+    const publicKey = Buffer.from(publicKeyB64, "base64");
+    return nacl.sign.detached.verify(messageBytes, signature, publicKey);
+  } catch {
+    return false;
+  }
+}
 
 type Intent = "send_money" | "check_balance" | "apply_loan";
 type Transaction = {
@@ -23,9 +35,46 @@ function isValidPin(pin: unknown): pin is string {
 }
 
 async function getWalletRow() {
-  const wallets = await supabase("wallets?select=id,balance,currency,pin_hash,pin_salt&limit=1");
+  // Explicitly scoped to device_id IS NULL — this is the one shared demo wallet
+  // used by the existing single-device voice/text flows. Device-registered
+  // wallets (see getWalletByDeviceId) are a separate namespace so registering
+  // a phone for offline payments can never accidentally hijack this row.
+  const wallets = await supabase("wallets?select=id,balance,currency,pin_hash,pin_salt&device_id=is.null&limit=1");
   const wallet = (wallets as Record<string, unknown>[])[0];
   if (!wallet?.id) throw new Error("The wallet row could not be found");
+  return wallet;
+}
+
+async function getWalletByDeviceId(deviceId: string) {
+  const wallets = await supabase(
+    `wallets?select=id,balance,currency,device_id,device_label,device_public_key&device_id=eq.${encodeURIComponent(deviceId)}&limit=1`,
+  );
+  return (wallets as Record<string, unknown>[])[0] ?? null;
+}
+
+/**
+ * Registers a phone for device-to-device offline payments, or returns its
+ * existing wallet if it already registered before. Called once, while online,
+ * typically right after the app first launches (mirrors how language
+ * preference gets set up) — the public key captured here is what
+ * /finance/offline/settle later verifies signed intents against.
+ */
+async function registerDevice(deviceId: string, publicKey: string, label: string) {
+  const existing = await getWalletByDeviceId(deviceId);
+  if (existing) return existing;
+  const created = await supabase("wallets", {
+    method: "POST",
+    headers: { Prefer: "return=representation" },
+    body: JSON.stringify({
+      balance: 25000,
+      currency: "INR",
+      device_id: deviceId,
+      device_label: label || null,
+      device_public_key: publicKey,
+    }),
+  });
+  const wallet = (created as Record<string, unknown>[])[0];
+  if (!wallet?.id) throw new Error("Unable to register this device");
   return wallet;
 }
 
@@ -523,6 +572,190 @@ router.get("/finance/contacts/:id/transactions", async (req, res) => {
     res.json({ transactions: (rows as Record<string, unknown>[]).map(normalizeTransaction) });
   } catch (error) {
     res.status(502).json({ message: error instanceof Error ? error.message : "Unable to load transaction history" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Device-to-device offline payments (NFC/BLE). These three routes are a
+// separate namespace from the single shared demo wallet above: each phone
+// gets its OWN wallet row, keyed by device_id, so two real phones running the
+// app side by side behave like two independent accounts.
+// ---------------------------------------------------------------------------
+
+router.post("/finance/device/register", async (req: Request, res) => {
+  const deviceId = typeof req.body?.deviceId === "string" ? req.body.deviceId.trim() : "";
+  const publicKey = typeof req.body?.publicKey === "string" ? req.body.publicKey.trim() : "";
+  const label = typeof req.body?.label === "string" ? req.body.label.trim() : "";
+  const lang = normalizeLang(req.body?.lang);
+  if (!deviceId || !publicKey) {
+    res.status(400).json({ message: await translateText("A device id and public key are required", lang) });
+    return;
+  }
+  try {
+    const wallet = await registerDevice(deviceId, publicKey, label);
+    res.json({
+      walletId: wallet.id,
+      balance: Number(wallet.balance ?? 0),
+      currency: wallet.currency ?? "INR",
+      label: wallet.device_label ?? null,
+    });
+  } catch (error) {
+    const fallback = error instanceof Error ? error.message : "Unable to register this device";
+    res.status(502).json({ message: await translateText(fallback, lang) });
+  }
+});
+
+router.get("/finance/device/:deviceId/dashboard", async (req, res) => {
+  const deviceId = req.params.deviceId;
+  const lang = normalizeLang(req.query?.lang);
+  try {
+    const wallet = await getWalletByDeviceId(deviceId);
+    if (!wallet) {
+      res.status(404).json({ message: await translateText("This device is not registered yet", lang) });
+      return;
+    }
+    const rows = await supabase(
+      `transactions?wallet_id=eq.${encodeURIComponent(String(wallet.id))}&select=*&order=created_at.desc&limit=25`,
+    );
+    res.json({
+      balance: Number(wallet.balance ?? 0),
+      currency: wallet.currency ?? "INR",
+      transactions: (rows as Record<string, unknown>[]).map(normalizeTransaction),
+    });
+  } catch (error) {
+    const fallback = error instanceof Error ? error.message : "Finance data unavailable";
+    res.status(502).json({ message: await translateText(fallback, lang) });
+  }
+});
+
+router.post("/finance/offline/settle", async (req: Request, res) => {
+  const lang = normalizeLang(req.body?.lang);
+  const intent = req.body?.intent as
+    | { nonce?: unknown; fromDeviceId?: unknown; toDeviceId?: unknown; toLabel?: unknown; amount?: unknown; currency?: unknown; createdAt?: unknown }
+    | undefined;
+  const signature = typeof req.body?.signature === "string" ? req.body.signature : "";
+
+  const nonce = typeof intent?.nonce === "string" ? intent.nonce : "";
+  const fromDeviceId = typeof intent?.fromDeviceId === "string" ? intent.fromDeviceId : "";
+  const toDeviceId = typeof intent?.toDeviceId === "string" ? intent.toDeviceId : "";
+  const toLabel = typeof intent?.toLabel === "string" ? intent.toLabel : "";
+  const amount = Number(intent?.amount ?? 0);
+  const currency = typeof intent?.currency === "string" ? intent.currency : "INR";
+  const createdAt = Number(intent?.createdAt ?? 0);
+
+  if (!nonce || !fromDeviceId || !toDeviceId || !amount || amount <= 0 || !signature) {
+    res.status(400).json({ message: await translateText("A complete signed payment intent is required", lang) });
+    return;
+  }
+
+  try {
+    // Idempotency: if this exact intent already settled (e.g. the sender's app
+    // retried after a flaky reconnect), return the prior result instead of
+    // moving money twice.
+    const existingSettlement = (
+      await supabase(`offline_settlements?nonce=eq.${encodeURIComponent(nonce)}&select=nonce&limit=1`)
+    )[0] as Record<string, unknown> | undefined;
+    if (existingSettlement) {
+      const senderWallet = await getWalletByDeviceId(fromDeviceId);
+      res.json({
+        message: await translateText("This payment was already settled.", lang),
+        balance: senderWallet ? Number(senderWallet.balance ?? 0) : undefined,
+        alreadySettled: true,
+      });
+      return;
+    }
+
+    const [senderWallet, recipientWallet] = await Promise.all([
+      getWalletByDeviceId(fromDeviceId),
+      getWalletByDeviceId(toDeviceId),
+    ]);
+    if (!senderWallet) throw new Error("Sender device is not registered");
+    if (!recipientWallet) throw new Error(`${toLabel || "Recipient"}'s device is not registered with Paisa Voice yet`);
+
+    const publicKey = typeof senderWallet.device_public_key === "string" ? senderWallet.device_public_key : "";
+    if (!publicKey) throw new Error("Sender device has no registered public key");
+
+    // Must match lib/offlinePaymentIntent.ts's canonicalizeIntent() on the client
+    // EXACTLY (same key order, same values) — this is what was actually signed.
+    const canonical = JSON.stringify({ nonce, fromDeviceId, toDeviceId, toLabel, amount, currency, createdAt });
+    if (!verifySignature(canonical, signature, publicKey)) {
+      res.status(401).json({ message: await translateText("This payment's signature could not be verified", lang) });
+      return;
+    }
+
+    const senderBalance = Number(senderWallet.balance ?? 0);
+    if (amount > senderBalance) {
+      throw new Error(
+        `Insufficient balance. Available balance is ₹${senderBalance.toLocaleString("en-IN")}, but the offline payment was for ₹${amount.toLocaleString("en-IN")}.`,
+      );
+    }
+
+    const recipientBalance = Number(recipientWallet.balance ?? 0);
+    const newSenderBalance = senderBalance - amount;
+    const newRecipientBalance = recipientBalance + amount;
+
+    // Record the idempotency ledger entry FIRST — if two settlement requests
+    // for the same nonce race each other, the second insert fails on the
+    // primary key and that request backs off instead of double-crediting.
+    try {
+      await supabase("offline_settlements", {
+        method: "POST",
+        headers: { Prefer: "return=minimal" },
+        body: JSON.stringify({
+          nonce,
+          from_wallet_id: senderWallet.id,
+          to_wallet_id: recipientWallet.id,
+          amount,
+        }),
+      });
+    } catch {
+      // Conflict on the nonce primary key — someone else already settled this exact intent.
+      res.json({ message: await translateText("This payment was already settled.", lang), alreadySettled: true });
+      return;
+    }
+
+    await Promise.all([
+      supabase(`wallets?id=eq.${encodeURIComponent(String(senderWallet.id))}`, {
+        method: "PATCH",
+        headers: { Prefer: "return=minimal" },
+        body: JSON.stringify({ balance: newSenderBalance }),
+      }),
+      supabase(`wallets?id=eq.${encodeURIComponent(String(recipientWallet.id))}`, {
+        method: "PATCH",
+        headers: { Prefer: "return=minimal" },
+        body: JSON.stringify({ balance: newRecipientBalance }),
+      }),
+      supabase("transactions", {
+        method: "POST",
+        headers: { Prefer: "return=minimal" },
+        body: JSON.stringify({
+          title: `Offline payment to ${toLabel || "recipient"}`,
+          recipient: toLabel || null,
+          amount,
+          direction: "out",
+          source: "offline_ble",
+          wallet_id: senderWallet.id,
+        }),
+      }),
+      supabase("transactions", {
+        method: "POST",
+        headers: { Prefer: "return=minimal" },
+        body: JSON.stringify({
+          title: "Offline payment received",
+          recipient: null,
+          amount,
+          direction: "in",
+          source: "offline_ble",
+          wallet_id: recipientWallet.id,
+        }),
+      }),
+    ]);
+
+    const message = await translateText(`₹${amount.toLocaleString("en-IN")} settled to ${toLabel || "recipient"}.`, lang);
+    res.json({ message, balance: newSenderBalance });
+  } catch (error) {
+    const fallback = error instanceof Error ? error.message : "Unable to settle offline payment";
+    res.status(502).json({ message: await translateText(fallback, lang) });
   }
 });
 

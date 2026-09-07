@@ -10,12 +10,7 @@ const LANGUAGE_STORAGE_KEY = 'paisaVoice.language';
 const STRINGS_VERSION = 2;
 const STRINGS_CACHE_PREFIX = `paisaVoice.strings.v${STRINGS_VERSION}.`;
 
-function apiUrl(path: string) {
-  const domain = process.env.EXPO_PUBLIC_DOMAIN;
-  const base = process.env.EXPO_PUBLIC_API_URL ?? (domain ? `https://${domain}` : '');
-  return `${base}/api${path}`;
-}
-
+import { apiUrl } from '@/lib/apiUrl';
 async function fetchTranslatedStrings(language: string): Promise<Strings> {
   const values = STRING_KEYS.map((key) => DEFAULT_STRINGS[key]);
   const response = await fetch(apiUrl('/finance/localize'), {
